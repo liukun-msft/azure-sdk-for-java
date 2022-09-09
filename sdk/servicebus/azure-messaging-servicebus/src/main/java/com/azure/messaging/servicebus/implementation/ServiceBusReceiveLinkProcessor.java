@@ -9,6 +9,7 @@ import com.azure.core.amqp.exception.AmqpErrorCondition;
 import com.azure.core.amqp.exception.AmqpException;
 import com.azure.core.amqp.implementation.AmqpReceiveLink;
 import com.azure.core.util.AsyncCloseable;
+import com.azure.core.util.CoreUtils;
 import com.azure.core.util.logging.ClientLogger;
 import org.apache.qpid.proton.amqp.transport.DeliveryState;
 import org.apache.qpid.proton.message.Message;
@@ -17,9 +18,11 @@ import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
 import reactor.core.Disposables;
 import reactor.core.Exceptions;
+import reactor.core.publisher.Flux;
 import reactor.core.publisher.FluxProcessor;
 import reactor.core.publisher.Mono;
 import reactor.core.publisher.Operators;
+import reactor.core.publisher.Sinks;
 import reactor.core.scheduler.Schedulers;
 
 import java.time.Duration;
@@ -216,8 +219,15 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
             currentLink = next;
             next.setEmptyCreditListener(() -> 0);
 
+            final Flux<Message> receive;
+            if (CoreUtils.isNullOrEmpty(System.getenv("PUB_ON_IN_SB_LINK_PROCESSOR_OFF"))) {
+                receive = next.receive().publishOn(Schedulers.boundedElastic());
+            } else {
+                receive = next.receive();
+            }
+
             currentLinkSubscriptions = Disposables.composite(
-                next.receive().publishOn(Schedulers.boundedElastic()).subscribe(
+                receive.subscribe(
                     message -> {
                         synchronized (queueLock) {
                             messageQueue.add(message);
@@ -265,7 +275,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
                     }));
         }
 
-        checkAndAddCredits(next);
+        checkAndAddCredits("OnNext", next);
         disposeReceiver(oldChannel);
 
         if (oldSubscription != null) {
@@ -408,7 +418,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
             return;
         }
 
-        checkAndAddCredits(link);
+        checkAndAddCredits("request(" + request + ")", link);
         drain();
     }
 
@@ -520,7 +530,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
                     pendingMessages.decrementAndGet();
 
                     if (prefetch > 0) { // re-fill messageQueue if there is prefetch configured.
-                        checkAndAddCredits(currentLink);
+                        checkAndAddCredits("drainQueue", currentLink);
                     }
                 } catch (Exception e) {
                     LOGGER.error("Exception occurred while handling downstream onNext operation.", e);
@@ -561,7 +571,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
         return true;
     }
 
-    private void checkAndAddCredits(AmqpReceiveLink link) {
+    private void checkAndAddCredits(String callSite, AmqpReceiveLink link) {
         if (link == null) {
             return;
         }
@@ -570,6 +580,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
             final int linkCredits = link.getCredits();
             final int credits = getCreditsToAdd(linkCredits);
             if (credits > 0) {
+                System.out.println(Thread.currentThread().getName() + " SBLinkProcessor" + "[" + callSite + "] Credit-Adding:" + credits);
                 link.addCredits(credits).subscribe();
             }
         }

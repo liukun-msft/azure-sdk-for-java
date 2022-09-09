@@ -8,11 +8,13 @@ import com.azure.core.amqp.AmqpEndpointState;
 import com.azure.core.amqp.AmqpRetryPolicy;
 import com.azure.core.amqp.exception.AmqpErrorCondition;
 import com.azure.core.amqp.exception.AmqpException;
+import com.azure.core.amqp.implementation.DeliveryUtil;
 import com.azure.core.amqp.implementation.ExceptionUtil;
 import com.azure.core.amqp.implementation.ReactorProvider;
 import com.azure.core.amqp.implementation.ReactorReceiver;
 import com.azure.core.amqp.implementation.TokenManager;
 import com.azure.core.amqp.implementation.handler.ReceiveLinkHandler;
+import com.azure.core.util.CoreUtils;
 import com.azure.core.util.logging.ClientLogger;
 import com.azure.messaging.servicebus.models.ServiceBusReceiveMode;
 import org.apache.qpid.proton.Proton;
@@ -86,6 +88,7 @@ public class ServiceBusReactorReceiver extends ReactorReceiver implements Servic
     private final ReactorProvider provider;
     private final Mono<String> sessionIdMono;
     private final Mono<OffsetDateTime> sessionLockedUntil;
+    private final boolean hasDispositionAcksStreaming;
 
     public ServiceBusReactorReceiver(AmqpConnection connection, String entityPath, Receiver receiver,
         ReceiveLinkHandler handler, TokenManager tokenManager, ReactorProvider provider, Duration timeout,
@@ -104,6 +107,16 @@ public class ServiceBusReactorReceiver extends ReactorReceiver implements Servic
         loggingContext.put(LINK_NAME_KEY, this.handler.getLinkName());
         loggingContext.put(ENTITY_PATH_KEY, entityPath);
         this.logger = new ClientLogger(ServiceBusReactorReceiver.class, loggingContext);
+
+        this.hasDispositionAcksStreaming = !CoreUtils.isNullOrEmpty(System.getenv("STREAM_DISPOSITION_ACKS"));
+
+        handler.setDispositionAckPredicate(lockToken -> {
+            if (lockToken == null) {
+                return false;
+            } else {
+                return unsettledDeliveries.containsKey(lockToken);
+            }
+        });
 
         this.sessionIdMono = getEndpointStates().filter(x -> x == AmqpEndpointState.ACTIVE)
             .next()
@@ -147,10 +160,21 @@ public class ServiceBusReactorReceiver extends ReactorReceiver implements Servic
 
     @Override
     public Flux<Message> receive() {
+        this.handler.getDispositionAcks()
+            .subscribe(delivery -> {
+                final String lockToken = DeliveryUtil.extractLockToken(delivery);
+                updateOutcome(lockToken, delivery);
+            });
+
         // Remove empty update disposition messages. The deliveries themselves are ACKs with no message.
-        return super.receive()
-            .filter(message -> message != EMPTY_MESSAGE)
-            .publishOn(Schedulers.boundedElastic());
+        if (CoreUtils.isNullOrEmpty(System.getenv("PUB_ON_IN_SB_REACTOR_RECVR_OFF"))) {
+            return super.receive()
+                .filter(message -> message != EMPTY_MESSAGE)
+                .publishOn(Schedulers.boundedElastic(), 1);
+        } else {
+            return super.receive()
+                .filter(message -> message != EMPTY_MESSAGE);
+        }
     }
 
     @Override
@@ -237,6 +261,11 @@ public class ServiceBusReactorReceiver extends ReactorReceiver implements Servic
             }
             return new MessageWithLockToken(message, lockToken);
         } else {
+            if (this.hasDispositionAcksStreaming) {
+                throw new IllegalStateException("decodeDelivery shouldn't called when disposition acks are streaming");
+            }
+            System.out.println(Thread.currentThread().getName() + " update-outcome:" + lockTokenString);
+
             updateOutcome(lockTokenString, delivery);
 
             // Return empty update disposition messages. The deliveries themselves are ACKs. There is no actual message

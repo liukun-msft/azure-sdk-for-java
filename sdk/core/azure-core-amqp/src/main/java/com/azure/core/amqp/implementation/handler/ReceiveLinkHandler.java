@@ -3,6 +3,8 @@
 
 package com.azure.core.amqp.implementation.handler;
 
+import com.azure.core.amqp.implementation.DeliveryUtil;
+import com.azure.core.util.CoreUtils;
 import com.azure.core.util.logging.LoggingEventBuilder;
 import org.apache.qpid.proton.amqp.Symbol;
 import org.apache.qpid.proton.amqp.messaging.Modified;
@@ -23,6 +25,7 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.Predicate;
 
 import static com.azure.core.amqp.implementation.AmqpLoggingUtils.addErrorCondition;
 import static com.azure.core.amqp.implementation.ClientConstants.EMIT_RESULT_KEY;
@@ -40,20 +43,43 @@ import static com.azure.core.amqp.implementation.ClientConstants.LINK_NAME_KEY;
 public class ReceiveLinkHandler extends LinkHandler {
     private final String linkName;
 
+    private final String entityPath;
+
     /**
      * Indicates whether or not the link has ever been remotely active (ie. the service has acknowledged that we have
      * opened a send link to the given entityPath.)
      */
     private final AtomicBoolean isRemoteActive = new AtomicBoolean();
     private final AtomicBoolean isTerminated = new AtomicBoolean();
+
+
     private final Sinks.Many<Delivery> deliveries = Sinks.many().multicast().onBackpressureBuffer();
     private final Set<Delivery> queuedDeliveries = Collections.newSetFromMap(new ConcurrentHashMap<>());
-    private final String entityPath;
+    private int deliveryCnt;
+
+    private Predicate<String> dispositionAckPredicate;
+    private final boolean shouldStreamDispositionAcks;
+    private final Sinks.Many<Delivery> dispositionAcks = Sinks.many().multicast().onBackpressureBuffer();
+    private final Set<Delivery> queuedDispositionAcks = Collections.newSetFromMap(new ConcurrentHashMap<>());
+    private int dispositionAckCnt;
 
     public ReceiveLinkHandler(String connectionId, String hostname, String linkName, String entityPath) {
         super(connectionId, hostname, entityPath);
         this.linkName = Objects.requireNonNull(linkName, "'linkName' cannot be null.");
         this.entityPath = Objects.requireNonNull(entityPath, "'entityPath' cannot be null.");
+
+        this.dispositionAckPredicate = null;
+        this.shouldStreamDispositionAcks = !CoreUtils.isNullOrEmpty(System.getenv("STREAM_DISPOSITION_ACKS"));
+        deliveryCnt = 0;
+        dispositionAckCnt = 0;
+    }
+
+    public void setDispositionAckPredicate(Predicate<String> predicate) {
+        this.dispositionAckPredicate = predicate;
+    }
+
+    public Flux<Delivery> getDispositionAcks() {
+        return dispositionAcks.asFlux().doOnNext(queuedDispositionAcks::remove);
     }
 
     public String getLinkName() {
@@ -62,6 +88,10 @@ public class ReceiveLinkHandler extends LinkHandler {
 
     public Flux<Delivery> getDeliveredMessages() {
         return deliveries.asFlux().doOnNext(queuedDeliveries::remove);
+    }
+
+    public int queuedSize() {
+        return queuedDeliveries.size();
     }
 
     /**
@@ -160,25 +190,58 @@ public class ReceiveLinkHandler extends LinkHandler {
                     delivery.disposition(new Modified());
                     delivery.settle();
                 } else {
-                    queuedDeliveries.add(delivery);
-                    deliveries.emitNext(delivery, (signalType, emitResult) -> {
-                        logger.atWarning()
-                            .addKeyValue(ENTITY_PATH_KEY, entityPath)
-                            .addKeyValue(LINK_NAME_KEY, linkName)
-                            .addKeyValue(EMIT_RESULT_KEY, emitResult)
-                            .log("Could not emit delivery. {}", delivery);
+                    final String lockToken = DeliveryUtil.extractLockToken(delivery);
+                    final boolean isDispositionAck = dispositionAckPredicate != null && dispositionAckPredicate.test(lockToken);
+                    if (isDispositionAck) {
+                        System.out.println(Thread.currentThread().getName() + " ReceiveLinkHandler [ack] : " + lockToken + " counter:" + dispositionAckCnt++);
+                    } else {
+                        System.out.println(Thread.currentThread().getName() + " ReceiveLinkHandler [message] : " + lockToken + " counter:" + deliveryCnt++);
+                    }
+                    if (isDispositionAck && shouldStreamDispositionAcks) {
+                        queuedDispositionAcks.add(delivery);
+                        dispositionAcks.emitNext(delivery, (signalType, emitResult) -> {
+                            logger.atWarning()
+                                .addKeyValue(ENTITY_PATH_KEY, entityPath)
+                                .addKeyValue(LINK_NAME_KEY, linkName)
+                                .addKeyValue(EMIT_RESULT_KEY, emitResult)
+                                .log("Could not emit disposition-ack. {}", delivery);
 
-                        if (emitResult == Sinks.EmitResult.FAIL_OVERFLOW
-                            && link.getLocalState() != EndpointState.CLOSED) {
-                            link.setCondition(new ErrorCondition(Symbol.getSymbol("delivery-buffer-overflow"),
-                                "Deliveries are not processed fast enough. Closing local link."));
-                            link.close();
+                            System.out.println(Thread.currentThread().getName() + " ReceiveLinkHandler [dis-error] : " + emitResult);
 
-                            return true;
-                        } else {
-                            return false;
-                        }
-                    });
+                            if (emitResult == Sinks.EmitResult.FAIL_OVERFLOW
+                                && link.getLocalState() != EndpointState.CLOSED) {
+                                link.setCondition(new ErrorCondition(Symbol.getSymbol("disposition-acks-buffer-overflow"),
+                                    "disposition-acks are not processed fast enough. Closing local link."));
+                                link.close();
+
+                                return true;
+                            } else {
+                                return false;
+                            }
+                        });
+                    } else {
+                        queuedDeliveries.add(delivery);
+                        deliveries.emitNext(delivery, (signalType, emitResult) -> {
+                            logger.atWarning()
+                                .addKeyValue(ENTITY_PATH_KEY, entityPath)
+                                .addKeyValue(LINK_NAME_KEY, linkName)
+                                .addKeyValue(EMIT_RESULT_KEY, emitResult)
+                                .log("Could not emit delivery. {}", delivery);
+
+                            System.out.println(Thread.currentThread().getName() + " ReceiveLinkHandler [deli-error] : " + emitResult);
+
+                            if (emitResult == Sinks.EmitResult.FAIL_OVERFLOW
+                                && link.getLocalState() != EndpointState.CLOSED) {
+                                link.setCondition(new ErrorCondition(Symbol.getSymbol("delivery-buffer-overflow"),
+                                    "Deliveries are not processed fast enough. Closing local link."));
+                                link.close();
+
+                                return true;
+                            } else {
+                                return false;
+                            }
+                        });
+                    }
                 }
             }
         }
@@ -242,11 +305,26 @@ public class ReceiveLinkHandler extends LinkHandler {
             return false;
         });
 
+        dispositionAcks.emitComplete((signalType, emitResult) -> {
+            logger.atVerbose()
+                .addKeyValue(ENTITY_PATH_KEY, entityPath)
+                .addKeyValue(LINK_NAME_KEY, linkName)
+                .log(errorMessage);
+            return false;
+        });
+
         queuedDeliveries.forEach(delivery -> {
             // abandon the queued deliveries as the receive link handler is closed
             delivery.disposition(new Modified());
             delivery.settle();
         });
         queuedDeliveries.clear();
+
+        queuedDispositionAcks.forEach(delivery -> {
+            // abandon the queued acks as the receive link handler is closed
+            delivery.disposition(new Modified());
+            delivery.settle();
+        });
+        queuedDispositionAcks.clear();
     }
 }

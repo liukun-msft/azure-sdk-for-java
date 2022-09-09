@@ -9,6 +9,7 @@ import com.azure.core.amqp.AmqpRetryOptions;
 import com.azure.core.amqp.exception.AmqpErrorCondition;
 import com.azure.core.amqp.implementation.handler.ReceiveLinkHandler;
 import com.azure.core.util.AsyncCloseable;
+import com.azure.core.util.CoreUtils;
 import com.azure.core.util.logging.ClientLogger;
 import org.apache.qpid.proton.Proton;
 import org.apache.qpid.proton.amqp.Symbol;
@@ -65,6 +66,8 @@ public class ReactorReceiver implements AmqpReceiveLink, AsyncCloseable, AutoClo
 
     private final AtomicReference<Supplier<Integer>> creditSupplier = new AtomicReference<>();
 
+    private final boolean creditUsesHandlerQSize;
+
     protected ReactorReceiver(AmqpConnection amqpConnection, String entityPath, Receiver receiver,
         ReceiveLinkHandler handler, TokenManager tokenManager, ReactorDispatcher dispatcher,
         AmqpRetryOptions retryOptions) {
@@ -80,12 +83,19 @@ public class ReactorReceiver implements AmqpReceiveLink, AsyncCloseable, AutoClo
 
         this.logger = new ClientLogger(ReactorReceiver.class, loggingContext);
 
+        this.creditUsesHandlerQSize = !CoreUtils.isNullOrEmpty(System.getenv("HANDLER_Q_SIZE_FOR_CREDIT"));
+
         // Delivered messages are not published on another scheduler because we want the settlement method that happens
         // in decodeDelivery to take place and since proton-j is not thread safe, it could end up with hundreds of
         // backed up deliveries waiting to be settled. (Which, consequently, ends up in a FAIL_OVERFLOW error from
         // the handler.
         this.messagesProcessor = this.handler.getDeliveredMessages()
+            // .doOnRequest(r -> System.out.println(Thread.currentThread().getName() + ": doOnRequest(" + r + ")"))
             .flatMap(delivery -> {
+
+                final String lockToken = DeliveryUtil.extractLockToken(delivery);
+                System.out.println(Thread.currentThread().getName() + " ReactorReceiver : " + lockToken);
+
                 return Mono.create(sink -> {
                     try {
                         this.dispatcher.invoke(() -> {
@@ -98,6 +108,7 @@ public class ReactorReceiver implements AmqpReceiveLink, AsyncCloseable, AutoClo
                             final int creditsLeft = receiver.getRemoteCredit();
 
                             if (creditsLeft > 0) {
+                                // System.out.println("Emitting....");
                                 sink.success(message);
                                 return;
                             }
@@ -122,7 +133,7 @@ public class ReactorReceiver implements AmqpReceiveLink, AsyncCloseable, AutoClo
                         sink.error(e);
                     }
                 });
-            }, 1);
+            }, 1, 1);
 
         this.retryOptions = retryOptions;
         this.endpointStates = this.handler.getEndpointStates()
@@ -220,7 +231,9 @@ public class ReactorReceiver implements AmqpReceiveLink, AsyncCloseable, AutoClo
 
     @Override
     public int getCredits() {
-        return receiver.getRemoteCredit();
+        return this.creditUsesHandlerQSize
+            ? receiver.getRemoteCredit() + handler.queuedSize()
+            : receiver.getRemoteCredit();
     }
 
     @Override
