@@ -232,7 +232,7 @@ public class ReactorReceiver implements AmqpReceiveLink, AsyncCloseable, AutoClo
     @Override
     public int getCredits() {
         return this.creditUsesHandlerQSize
-            ? receiver.getRemoteCredit() + handler.queuedSize()
+            ? receiver.getCredit()
             : receiver.getRemoteCredit();
     }
 

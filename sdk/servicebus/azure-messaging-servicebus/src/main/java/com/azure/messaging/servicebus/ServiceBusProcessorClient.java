@@ -13,6 +13,7 @@ import com.azure.messaging.servicebus.implementation.models.ServiceBusProcessorC
 import org.reactivestreams.Subscription;
 import reactor.core.CoreSubscriber;
 import reactor.core.Disposable;
+import reactor.core.publisher.Mono;
 import reactor.core.publisher.Signal;
 import reactor.core.scheduler.Schedulers;
 
@@ -310,84 +311,85 @@ public final class ServiceBusProcessorClient implements AutoCloseable {
         }
         ServiceBusReceiverAsyncClient receiverClient = asyncClient.get();
 
-        @SuppressWarnings({"unchecked", "rawtypes"})
-        CoreSubscriber<ServiceBusMessageContext>[] subscribers = new CoreSubscriber[processorOptions.getMaxConcurrentCalls()];
+        CoreSubscriber<ServiceBusMessageContext> subscriber = new CoreSubscriber<ServiceBusMessageContext>() {
+            private Subscription subscription = null;
 
-        for (int i = 0; i < processorOptions.getMaxConcurrentCalls(); i++) {
-            subscribers[i] = new CoreSubscriber<ServiceBusMessageContext>() {
-                private Subscription subscription = null;
+            @Override
+            public void onSubscribe(Subscription subscription) {
+                this.subscription = subscription;
+                receiverSubscriptions.put(subscription, subscription);
+                subscription.request(1);
+            }
 
-                @Override
-                public void onSubscribe(Subscription subscription) {
-                    this.subscription = subscription;
-                    receiverSubscriptions.put(subscription, subscription);
+            @Override
+            public void onNext(ServiceBusMessageContext serviceBusMessageContext) {
+                if (isRunning.get()) {
+                    LOGGER.verbose("Requesting 1 more message from upstream");
                     subscription.request(1);
                 }
+            }
 
-                @Override
-                public void onNext(ServiceBusMessageContext serviceBusMessageContext) {
-                    if (serviceBusMessageContext.hasError()) {
-                        handleError(serviceBusMessageContext.getThrowable());
-                    } else {
-                        Context processSpanContext = null;
-                        try {
-                            ServiceBusReceivedMessageContext serviceBusReceivedMessageContext =
-                                new ServiceBusReceivedMessageContext(receiverClient, serviceBusMessageContext);
-
-                            processSpanContext =
-                                startProcessTracingSpan(serviceBusMessageContext.getMessage(),
-                                    receiverClient.getEntityPath(), receiverClient.getFullyQualifiedNamespace());
-                            if (processSpanContext.getData(SPAN_CONTEXT_KEY).isPresent()) {
-                                serviceBusMessageContext.getMessage().addContext(SPAN_CONTEXT_KEY, processSpanContext);
-                            }
-                            processMessage.accept(serviceBusReceivedMessageContext);
-                            endProcessTracingSpan(processSpanContext, Signal.complete());
-                        } catch (Exception ex) {
-                            handleError(new ServiceBusException(ex, ServiceBusErrorSource.USER_CALLBACK));
-                            endProcessTracingSpan(processSpanContext, Signal.error(ex));
-                            if (!processorOptions.isDisableAutoComplete()) {
-                                LOGGER.warning("Error when processing message. Abandoning message.", ex);
-                                abandonMessage(serviceBusMessageContext, receiverClient);
-                            }
-                        }
-                    }
-                    if (isRunning.get()) {
-                        LOGGER.verbose("Requesting 1 more message from upstream");
-                        subscription.request(1);
-                    }
+            @Override
+            public void onError(Throwable throwable) {
+                LOGGER.info("Error receiving messages.", throwable);
+                handleError(throwable);
+                if (isRunning.get()) {
+                    restartMessageReceiver(subscription);
                 }
+            }
 
-                @Override
-                public void onError(Throwable throwable) {
-                    LOGGER.info("Error receiving messages.", throwable);
-                    handleError(throwable);
-                    if (isRunning.get()) {
-                        restartMessageReceiver(subscription);
-                    }
+            @Override
+            public void onComplete() {
+                LOGGER.info("Completed receiving messages.");
+                if (isRunning.get()) {
+                    restartMessageReceiver(subscription);
                 }
-
-                @Override
-                public void onComplete() {
-                    LOGGER.info("Completed receiving messages.");
-                    if (isRunning.get()) {
-                        restartMessageReceiver(subscription);
-                    }
-                }
-            };
-        }
+            }
+        };
 
         if (processorOptions.getMaxConcurrentCalls() > 1) {
-            receiverClient.receiveMessagesWithContext()
-                .parallel(processorOptions.getMaxConcurrentCalls(), 1)
-                .runOn(Schedulers.boundedElastic(), 1)
-                .subscribe(subscribers);
+            receiverClient.receiveMessagesWithContext(0)
+                .flatMap(message -> Mono.just(message)
+                        .publishOn(Schedulers.boundedElastic())
+                        .doOnNext(serviceBusMessageContext -> handleProcessMessage(receiverClient, serviceBusMessageContext)),
+                    processorOptions.getMaxConcurrentCalls())
+                .subscribe(subscriber);
         } else {
             // For the default case, i.e., when max-concurrent-call is one, the Processor handler can be invoked on
             // the same Bounded-Elastic thread that the Low-Level Receiver obtained. This way, we can avoid
             // the unnecessary thread hopping and allocation that otherwise would have been introduced by the parallel
             // and runOn operators for this code path.
             receiverClient.receiveMessagesWithContext()
-                .subscribe(subscribers[0]);
+                .doOnNext(serviceBusMessageContext -> handleProcessMessage(receiverClient, serviceBusMessageContext))
+                .subscribe(subscriber);
+        }
+    }
+
+    private void handleProcessMessage(ServiceBusReceiverAsyncClient receiverClient, ServiceBusMessageContext serviceBusMessageContext) {
+        if (serviceBusMessageContext.hasError()) {
+            handleError(serviceBusMessageContext.getThrowable());
+        } else {
+            Context processSpanContext = null;
+            try {
+                ServiceBusReceivedMessageContext serviceBusReceivedMessageContext =
+                    new ServiceBusReceivedMessageContext(receiverClient, serviceBusMessageContext);
+
+                processSpanContext =
+                    startProcessTracingSpan(serviceBusMessageContext.getMessage(),
+                        receiverClient.getEntityPath(), receiverClient.getFullyQualifiedNamespace());
+                if (processSpanContext.getData(SPAN_CONTEXT_KEY).isPresent()) {
+                    serviceBusMessageContext.getMessage().addContext(SPAN_CONTEXT_KEY, processSpanContext);
+                }
+                processMessage.accept(serviceBusReceivedMessageContext);
+                endProcessTracingSpan(processSpanContext, Signal.complete());
+            } catch (Exception ex) {
+                handleError(new ServiceBusException(ex, ServiceBusErrorSource.USER_CALLBACK));
+                endProcessTracingSpan(processSpanContext, Signal.error(ex));
+                if (!processorOptions.isDisableAutoComplete()) {
+                    LOGGER.warning("Error when processing message. Abandoning message.", ex);
+                    abandonMessage(serviceBusMessageContext, receiverClient);
+                }
+            }
         }
     }
 
