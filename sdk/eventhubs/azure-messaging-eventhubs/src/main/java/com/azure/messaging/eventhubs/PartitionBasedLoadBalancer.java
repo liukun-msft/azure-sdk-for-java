@@ -9,13 +9,13 @@ import com.azure.core.util.logging.LogLevel;
 import com.azure.messaging.eventhubs.models.ErrorContext;
 import com.azure.messaging.eventhubs.models.PartitionContext;
 import com.azure.messaging.eventhubs.models.PartitionOwnership;
-
-import java.time.Duration;
-import java.util.concurrent.atomic.AtomicBoolean;
 import reactor.core.Exceptions;
 import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Scheduler;
+import reactor.core.scheduler.Schedulers;
 import reactor.util.function.Tuple2;
 
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -23,6 +23,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Random;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -63,6 +64,7 @@ final class PartitionBasedLoadBalancer {
     private final LoadBalancingStrategy loadBalancingStrategy;
     private final AtomicBoolean morePartitionsToClaim = new AtomicBoolean();
     private final AtomicReference<List<String>> partitionsCache = new AtomicReference<>(new ArrayList<>());
+    private final Scheduler scheduler;
 
     /**
      * Creates an instance of PartitionBasedLoadBalancer for the given Event Hub name and consumer group.
@@ -95,6 +97,7 @@ final class PartitionBasedLoadBalancer {
         this.partitionAgnosticContext = new PartitionContext(fullyQualifiedNamespace, eventHubName,
             consumerGroupName, "NONE");
         this.loadBalancingStrategy = loadBalancingStrategy;
+        this.scheduler = Schedulers.newBoundedElastic(2, 2, "load-balance");
     }
 
     /**
@@ -148,6 +151,7 @@ final class PartitionBasedLoadBalancer {
         }
 
         Mono.zip(partitionOwnershipMono, partitionsMono)
+            .publishOn(scheduler)
             .flatMap(this::loadBalance)
             .then()
             .repeat(() -> LoadBalancingStrategy.GREEDY == loadBalancingStrategy && morePartitionsToClaim.get())
@@ -314,12 +318,14 @@ final class PartitionBasedLoadBalancer {
                     .getOwnerId().equals(this.ownerId))
             .map(partitionId -> createPartitionOwnershipRequest(partitionOwnershipMap, partitionId))
             .collect(Collectors.toList()))
-            .subscribe(partitionPumpManager::verifyPartitionConnection,
-                ex -> {
-                    LOGGER.error("Error renewing partition ownership", ex);
-                    isLoadBalancerRunning.set(false);
-                },
-                () -> isLoadBalancerRunning.set(false));
+            .publishOn(scheduler)
+            .doOnNext(partitionPumpManager::verifyPartitionConnection)
+            .doOnError(ex -> {
+                LOGGER.error("Error renewing partition ownership", ex);
+                isLoadBalancerRunning.set(false);
+            })
+            .doOnComplete(() -> isLoadBalancerRunning.set(false))
+            .blockLast();
     }
 
     private String format(Map<String, List<PartitionOwnership>> ownerPartitionMap) {
@@ -459,29 +465,31 @@ final class PartitionBasedLoadBalancer {
                 .addKeyValue(PARTITION_ID_KEY, ownershipRequest.getPartitionId())
                 .log(Messages.FAILED_TO_CLAIM_OWNERSHIP, ex))
             .collectList()
+            .publishOn(scheduler)
             .zipWhen(ownershipList -> checkpointStore.listCheckpoints(fullyQualifiedNamespace, eventHubName,
                 consumerGroupName)
                 .collectMap(checkpoint -> checkpoint.getPartitionId(), Function.identity()))
-            .subscribe(ownedPartitionCheckpointsTuple -> {
-                ownedPartitionCheckpointsTuple.getT1()
-                    .stream()
-                    .forEach(po -> partitionPumpManager.startPartitionPump(po,
-                        ownedPartitionCheckpointsTuple.getT2().get(po.getPartitionId())));
-            },
-                ex -> {
-                    LOGGER.warning("Error while claiming checkpoints", ex);
-                    ErrorContext errorContext = new ErrorContext(partitionAgnosticContext, ex);
-                    processError.accept(errorContext);
-                    if (loadBalancingStrategy == LoadBalancingStrategy.BALANCED) {
-                        isLoadBalancerRunning.set(false);
-                    }
-                    throw LOGGER.logExceptionAsError(new IllegalStateException("Error while claiming checkpoints", ex));
-                },
-                () -> {
-                    if (loadBalancingStrategy == LoadBalancingStrategy.BALANCED) {
-                        isLoadBalancerRunning.set(false);
-                    }
-                });
+            .publishOn(scheduler)
+            .doOnNext(ownedPartitionCheckpointsTuple ->
+                    ownedPartitionCheckpointsTuple.getT1()
+                        .stream()
+                        .forEach(po -> partitionPumpManager.startPartitionPump(po,
+                            ownedPartitionCheckpointsTuple.getT2().get(po.getPartitionId()))))
+            .doOnError(ex -> {
+                LOGGER.warning("Error while claiming checkpoints", ex);
+                ErrorContext errorContext = new ErrorContext(partitionAgnosticContext, ex);
+                processError.accept(errorContext);
+                if (loadBalancingStrategy == LoadBalancingStrategy.BALANCED) {
+                    isLoadBalancerRunning.set(false);
+                }
+                throw LOGGER.logExceptionAsError(new IllegalStateException("Error while claiming checkpoints", ex));
+            })
+            .doOnSuccess(ownedPartitionCheckpointsTuple -> {
+                if (loadBalancingStrategy == LoadBalancingStrategy.BALANCED) {
+                    isLoadBalancerRunning.set(false);
+                }
+            })
+            .block();
     }
 
     private PartitionOwnership createPartitionOwnershipRequest(
