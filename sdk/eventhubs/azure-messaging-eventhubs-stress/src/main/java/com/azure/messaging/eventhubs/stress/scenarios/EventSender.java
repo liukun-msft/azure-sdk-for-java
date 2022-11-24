@@ -23,13 +23,13 @@ public class EventSender extends EventHubsScenario {
 
     private static final Random RANDOM = new Random();
 
-    @Value("${SEND_TIMES:1000000}")
+    @Value("${SEND_TIMES:10000}")
     private int sendTimes;
 
     @Value("${SEND_EVENTS:100}")
     private int eventsToSend;
 
-    @Value("${PAYLOAD_SIZE_IN_BYTE:8}")
+    @Value("${PAYLOAD_SIZE_IN_BYTE:10000}")
     private int payloadSize;
 
     @Override

@@ -1,3 +1,5 @@
 matrix:
     scenarios:
-        - longrunning
+        - sender
+        - receiver
+
