@@ -13,6 +13,7 @@ import reactor.core.publisher.Flux;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
 
 /**
@@ -23,7 +24,7 @@ public class EventSender extends EventHubsScenario {
 
     private static final Random RANDOM = new Random();
 
-    @Value("${SEND_TIMES:10000}")
+    @Value("${SEND_TIMES:1000000}")
     private int sendTimes;
 
     @Value("${SEND_EVENTS:100}")
@@ -49,6 +50,12 @@ public class EventSender extends EventHubsScenario {
             IntStream.range(0, eventsToSend).forEach(j -> {
                 eventDataList.add(new EventData(payload));
             });
+
+            try {
+                TimeUnit.MILLISECONDS.sleep(200);
+            } catch (InterruptedException e) {
+                e.printStackTrace();
+            }
             return client.send(eventDataList);
         }).blockLast();
 
