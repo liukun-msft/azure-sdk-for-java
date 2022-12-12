@@ -26,6 +26,7 @@ import java.time.Duration;
 import java.util.Deque;
 import java.util.Objects;
 import java.util.concurrent.ConcurrentLinkedDeque;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLongFieldUpdater;
@@ -54,6 +55,8 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
     private final Object queueLock = new Object();
     private final AtomicBoolean isTerminated = new AtomicBoolean();
     private final AtomicInteger retryAttempts = new AtomicInteger();
+
+    private final AtomicInteger counter = new AtomicInteger();
     private final AtomicReference<String> linkName = new AtomicReference<>();
 
     // Queue containing all the prefetched messages.
@@ -268,11 +271,22 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
         }
 
         checkAndAddCredits(next);
+        
+//  // Solution 1: catch the error, and call onError
+//        try {
+//            checkAndAddCredits(next);
+//        } catch (Exception e) {
+//            LOGGER.info("Get link failure");
+//
+//            currentLink = null;
+//            onError(e);
+//        }
         disposeReceiver(oldChannel);
 
         if (oldSubscription != null) {
             oldSubscription.dispose();
         }
+
     }
 
     /**
@@ -572,7 +586,14 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
             final int linkCredits = link.getCredits();
             final int credits = getCreditsToAdd(linkCredits);
             if (credits > 0) {
-                link.addCredits(credits).subscribe();
+                counter.getAndIncrement();
+                if(counter.get() == 1) {
+                    throw new IllegalStateException("Can't add credits");
+                } else {
+                    link.addCredits(credits).subscribe();
+                }
+
+
             }
         }
     }
