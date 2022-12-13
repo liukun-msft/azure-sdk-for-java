@@ -6,10 +6,13 @@ package com.azure.messaging.servicebus.implementation;
 import com.azure.core.amqp.AmqpEndpointState;
 import com.azure.core.amqp.AmqpRetryPolicy;
 import com.azure.core.amqp.exception.AmqpErrorCondition;
+import com.azure.core.amqp.exception.AmqpErrorContext;
 import com.azure.core.amqp.exception.AmqpException;
 import com.azure.core.amqp.implementation.AmqpReceiveLink;
 import com.azure.core.util.AsyncCloseable;
 import com.azure.core.util.logging.ClientLogger;
+import com.azure.messaging.servicebus.ServiceBusErrorSource;
+import com.azure.messaging.servicebus.ServiceBusException;
 import org.apache.qpid.proton.amqp.transport.DeliveryState;
 import org.apache.qpid.proton.message.Message;
 import org.reactivestreams.Subscription;
@@ -56,7 +59,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
     private final AtomicBoolean isTerminated = new AtomicBoolean();
     private final AtomicInteger retryAttempts = new AtomicInteger();
 
-    private final AtomicInteger counter = new AtomicInteger();
+    private final static AtomicInteger counter = new AtomicInteger();
     private final AtomicReference<String> linkName = new AtomicReference<>();
 
     // Queue containing all the prefetched messages.
@@ -271,16 +274,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
         }
 
         checkAndAddCredits(next);
-        
-//  // Solution 1: catch the error, and call onError
-//        try {
-//            checkAndAddCredits(next);
-//        } catch (Exception e) {
-//            LOGGER.info("Get link failure");
-//
-//            currentLink = null;
-//            onError(e);
-//        }
+
         disposeReceiver(oldChannel);
 
         if (oldSubscription != null) {
@@ -588,12 +582,16 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
             if (credits > 0) {
                 counter.getAndIncrement();
                 if(counter.get() == 1) {
-                    throw new IllegalStateException("Can't add credits");
+                    Mono.error(new RuntimeException("Can't add credits")).subscribe(__ -> {}, err -> {
+                        LOGGER.warning("add credits encounter error");
+                        onError(err);
+                    });
                 } else {
-                    link.addCredits(credits).subscribe();
+                    link.addCredits(credits).subscribe(__ -> {}, err -> {
+                        LOGGER.warning("add credits encounter error");
+                        onError(err);
+                    });
                 }
-
-
             }
         }
     }
