@@ -3,6 +3,7 @@
 
 package com.azure.messaging.servicebus;
 
+import com.azure.core.amqp.AmqpEndpointState;
 import com.azure.core.amqp.AmqpRetryPolicy;
 import com.azure.core.amqp.AmqpTransaction;
 import com.azure.core.amqp.exception.AmqpException;
@@ -1543,6 +1544,11 @@ public final class ServiceBusReceiverAsyncClient implements AutoCloseable {
         // (e.g., when the service decides to close that link).
         //
         final Flux<ServiceBusReceiveLink> receiveLinkFlux = retryableReceiveLinkMono.repeat();
+//            .flatMap(link -> link.getEndpointStates()
+//                .takeUntil(e -> e != AmqpEndpointState.CLOSED)
+//                .timeout(connectionProcessor.getRetryOptions().getTryTimeout())
+//                .then(Mono.just(link))
+//            );
 
         final AmqpRetryPolicy retryPolicy = RetryUtil.getRetryPolicy(connectionProcessor.getRetryOptions());
         final ServiceBusReceiveLinkProcessor linkMessageProcessor = receiveLinkFlux.subscribeWith(

@@ -364,12 +364,14 @@ public class ReactorSession implements AmqpSession {
         }
 
         final LinkSubscription<AmqpReceiveLink> existingLink = openReceiveLinks.get(linkName);
-        if (existingLink != null) {
+        if (existingLink != null && !existingLink.getLink().isDisposed()) {
             logger.atInfo()
                 .addKeyValue(LINK_NAME_KEY, linkName)
                 .addKeyValue(ENTITY_PATH_KEY, entityPath)
                 .log("Returning existing receive link.");
-            return Mono.just(existingLink.getLink());
+            return Mono.create((Consumer<MonoSink<AmqpReceiveLink>>) sink -> {
+                sink.success(existingLink.getLink());
+            });
         }
 
         final TokenManager tokenManager = tokenManagerProvider.getTokenManager(cbsNodeSupplier, entityPath);
@@ -381,7 +383,7 @@ public class ReactorSession implements AmqpSession {
                     provider.getReactorDispatcher().invoke(() -> {
                         final LinkSubscription<AmqpReceiveLink> computed = openReceiveLinks.compute(linkName,
                             (linkNameKey, existing) -> {
-                                if (existing != null) {
+                                if (existing != null && !existing.getLink().isDisposed()) {
                                     logger.atInfo()
                                         .addKeyValue(LINK_NAME_KEY, linkName)
                                         .log("Another receive link exists. Disposing of new one.");

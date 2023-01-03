@@ -581,7 +581,7 @@ public class ServiceBusReceiveLinkProcessor extends FluxProcessor<ServiceBusRece
             final int credits = getCreditsToAdd(linkCredits);
             if (credits > 0) {
                 counter.getAndIncrement();
-                if(counter.get() == 1) {
+                if(counter.get() < 0) {
                     Mono.error(new RuntimeException("Can't add credits")).subscribe(__ -> {}, err -> {
                         LOGGER.warning("add credits encounter error");
                         onError(err);

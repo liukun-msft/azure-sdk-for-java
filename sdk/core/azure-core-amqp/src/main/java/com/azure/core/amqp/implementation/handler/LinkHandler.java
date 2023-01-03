@@ -97,7 +97,7 @@ abstract class LinkHandler extends Handler {
 
     private void handleRemoteLinkClosed(final String eventName, final Event event) {
         final Link link = event.getLink();
-        final ErrorCondition condition = link.getRemoteCondition();
+        final ErrorCondition condition = null;
 
         addErrorCondition(logger.atInfo(), condition)
             .addKeyValue(LINK_NAME_KEY, link.getName())
