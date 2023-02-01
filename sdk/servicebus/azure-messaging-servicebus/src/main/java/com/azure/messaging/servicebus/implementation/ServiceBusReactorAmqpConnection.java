@@ -14,6 +14,7 @@ import com.azure.core.amqp.implementation.ReactorConnection;
 import com.azure.core.amqp.implementation.ReactorHandlerProvider;
 import com.azure.core.amqp.implementation.ReactorProvider;
 import com.azure.core.amqp.implementation.RetryUtil;
+import com.azure.core.amqp.implementation.StringUtil;
 import com.azure.core.amqp.implementation.TokenManager;
 import com.azure.core.amqp.implementation.TokenManagerProvider;
 import com.azure.core.amqp.implementation.handler.SessionHandler;
@@ -27,10 +28,13 @@ import org.apache.qpid.proton.engine.Session;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Scheduler;
 
+import java.util.Locale;
+import java.util.Objects;
 import java.util.concurrent.ConcurrentHashMap;
 
 import static com.azure.core.amqp.implementation.ClientConstants.ENTITY_PATH_KEY;
 import static com.azure.core.amqp.implementation.ClientConstants.LINK_NAME_KEY;
+import static com.azure.core.amqp.implementation.ClientConstants.SESSION_NAME_KEY;
 
 /**
  * A proton-j AMQP connection to an Azure Service Bus instance.
@@ -41,6 +45,7 @@ public class ServiceBusReactorAmqpConnection extends ReactorConnection implement
     private static final String MANAGEMENT_LINK_NAME = "mgmt";
     private static final String MANAGEMENT_ADDRESS = "$management";
     private static final String CROSS_ENTITY_TRANSACTIONS_LINK_NAME = "crossentity-coordinator";
+    private static final String SESSION_RECEIVER_SESSION_NAME_FORMAT = "%s/SessionId/%s";
 
     private static final ClientLogger LOGGER = new ClientLogger(ServiceBusReactorAmqpConnection.class);
     private final ConcurrentHashMap<String, ServiceBusManagementNode> managementNodes = new ConcurrentHashMap<>();
@@ -149,11 +154,11 @@ public class ServiceBusReactorAmqpConnection extends ReactorConnection implement
     public Mono<AmqpSendLink> createSendLink(String linkName, String entityPath, AmqpRetryOptions retryOptions,
         String transferEntityPath, String clientIdentifier) {
 
-        return createSession(linkName).cast(ServiceBusSession.class).flatMap(session -> {
+        return createSession(entityPath).cast(ServiceBusSession.class).flatMap(session -> {
             LOGGER.atVerbose().addKeyValue(LINK_NAME_KEY, linkName).log("Get or create sender link.");
             final AmqpRetryPolicy retryPolicy = RetryUtil.getRetryPolicy(retryOptions);
 
-            return session.createProducer(linkName + entityPath, entityPath, retryOptions.getTryTimeout(),
+            return session.createProducer(linkName, entityPath, retryOptions.getTryTimeout(),
                 retryPolicy, transferEntityPath, clientIdentifier).cast(AmqpSendLink.class);
         });
     }
@@ -207,9 +212,18 @@ public class ServiceBusReactorAmqpConnection extends ReactorConnection implement
     @Override
     public Mono<ServiceBusReceiveLink> createReceiveLink(String linkName, String entityPath, ServiceBusReceiveMode receiveMode,
         String transferEntityPath, MessagingEntityType entityType, String clientIdentifier, String sessionId) {
-        return createSession(entityPath).cast(ServiceBusSession.class)
+        // For session receiver, use session id as part of session name, which means we will create a new session
+        // for same entity when receive a different session id.
+        final String sessionName = (sessionId != null)
+                ? String.format(Locale.US, SESSION_RECEIVER_SESSION_NAME_FORMAT, entityPath, sessionId)
+                : entityPath;
+
+        return createSession(sessionName).cast(ServiceBusSession.class)
             .flatMap(session -> {
-                LOGGER.atVerbose().addKeyValue(ENTITY_PATH_KEY, entityPath).log("Get or create consumer.");
+                LOGGER.atVerbose().addKeyValue(ENTITY_PATH_KEY, entityPath)
+                    .addKeyValue(SESSION_NAME_KEY, sessionName)
+                    .addKeyValue("session id ", sessionId)
+                    .log("Get or create consumer.");
                 final AmqpRetryPolicy retryPolicy = RetryUtil.getRetryPolicy(retryOptions);
 
                 return session.createConsumer(linkName, entityPath, entityType, retryOptions.getTryTimeout(),

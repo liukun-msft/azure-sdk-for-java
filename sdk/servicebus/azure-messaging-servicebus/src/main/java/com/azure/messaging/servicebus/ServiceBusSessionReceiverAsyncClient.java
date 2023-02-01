@@ -136,6 +136,7 @@ public final class ServiceBusSessionReceiverAsyncClient implements AutoCloseable
     public Mono<ServiceBusReceiverAsyncClient> acceptNextSession() {
         return tracer.traceMono("ServiceBus.acceptNextSession", unNamedSessionManager.getActiveLink().flatMap(receiveLink -> receiveLink.getSessionId()
             .map(sessionId -> {
+                LOGGER.info("session id %s" + sessionId);
                 final ReceiverOptions newReceiverOptions = new ReceiverOptions(receiverOptions.getReceiveMode(),
                     receiverOptions.getPrefetchCount(), receiverOptions.getMaxLockRenewDuration(),
                     receiverOptions.isEnableAutoComplete(), sessionId, null);
